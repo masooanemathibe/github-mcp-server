@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,14 +13,15 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/github/github-mcp-server/pkg/errors"
 	"github.com/github/github-mcp-server/pkg/github"
 	mcplog "github.com/github/github-mcp-server/pkg/log"
+	"github.com/github/github-mcp-server/pkg/raw"
 	"github.com/github/github-mcp-server/pkg/translations"
-	gogithub "github.com/google/go-github/v69/github"
+	gogithub "github.com/google/go-github/v74/github"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/shurcooL/githubv4"
-	"github.com/sirupsen/logrus"
 )
 
 type MCPServerConfig struct {
@@ -45,7 +47,12 @@ type MCPServerConfig struct {
 
 	// Translator provides translated text for the server tooling
 	Translator translations.TranslationHelperFunc
+
+	// Content window size
+	ContentWindowSize int
 }
+
+const stdioServerLogPrefix = "stdioserver"
 
 func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 	apiHost, err := parseAPIHost(cfg.Host)
@@ -89,9 +96,14 @@ func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 
 	hooks := &server.Hooks{
 		OnBeforeInitialize: []server.OnBeforeInitializeFunc{beforeInit},
+		OnBeforeAny: []server.BeforeAnyHookFunc{
+			func(ctx context.Context, _ any, _ mcp.MCPMethod, _ any) {
+				// Ensure the context is cleared of any previous errors
+				// as context isn't propagated through middleware
+				errors.ContextWithGitHubErrors(ctx)
+			},
+		},
 	}
-
-	ghServer := github.NewServer(cfg.Version, server.WithHooks(hooks))
 
 	enabledToolsets := cfg.EnabledToolsets
 	if cfg.DynamicToolsets {
@@ -104,6 +116,14 @@ func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 		}
 	}
 
+	// Generate instructions based on enabled toolsets
+	instructions := github.GenerateInstructions(enabledToolsets)
+
+	ghServer := github.NewServer(cfg.Version,
+		server.WithInstructions(instructions),
+		server.WithHooks(hooks),
+	)
+
 	getClient := func(_ context.Context) (*gogithub.Client, error) {
 		return restClient, nil // closing over client
 	}
@@ -112,27 +132,27 @@ func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 		return gqlClient, nil // closing over client
 	}
 
-	// Create default toolsets
-	toolsets, err := github.InitToolsets(
-		enabledToolsets,
-		cfg.ReadOnly,
-		getClient,
-		getGQLClient,
-		cfg.Translator,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize toolsets: %w", err)
+	getRawClient := func(ctx context.Context) (*raw.Client, error) {
+		client, err := getClient(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get GitHub client: %w", err)
+		}
+		return raw.NewClient(client, apiHost.rawURL), nil // closing over client
 	}
 
-	context := github.InitContextToolset(getClient, cfg.Translator)
-	github.RegisterResources(ghServer, getClient, cfg.Translator)
+	// Create default toolsets
+	tsg := github.DefaultToolsetGroup(cfg.ReadOnly, getClient, getGQLClient, getRawClient, cfg.Translator, cfg.ContentWindowSize)
+	err = tsg.EnableToolsets(enabledToolsets, nil)
 
-	// Register the tools with the server
-	toolsets.RegisterTools(ghServer)
-	context.RegisterTools(ghServer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to enable toolsets: %w", err)
+	}
+
+	// Register all mcp functionality with the server
+	tsg.RegisterAll(ghServer)
 
 	if cfg.DynamicToolsets {
-		dynamic := github.InitDynamicToolset(ghServer, toolsets, cfg.Translator)
+		dynamic := github.InitDynamicToolset(ghServer, tsg, cfg.Translator)
 		dynamic.RegisterTools(ghServer)
 	}
 
@@ -169,6 +189,9 @@ type StdioServerConfig struct {
 
 	// Path to the log file if not stderr
 	LogFilePath string
+
+	// Content window size
+	ContentWindowSize int
 }
 
 // RunStdioServer is not concurrent safe.
@@ -180,13 +203,14 @@ func RunStdioServer(cfg StdioServerConfig) error {
 	t, dumpTranslations := translations.TranslationHelper()
 
 	ghServer, err := NewMCPServer(MCPServerConfig{
-		Version:         cfg.Version,
-		Host:            cfg.Host,
-		Token:           cfg.Token,
-		EnabledToolsets: cfg.EnabledToolsets,
-		DynamicToolsets: cfg.DynamicToolsets,
-		ReadOnly:        cfg.ReadOnly,
-		Translator:      t,
+		Version:           cfg.Version,
+		Host:              cfg.Host,
+		Token:             cfg.Token,
+		EnabledToolsets:   cfg.EnabledToolsets,
+		DynamicToolsets:   cfg.DynamicToolsets,
+		ReadOnly:          cfg.ReadOnly,
+		Translator:        t,
+		ContentWindowSize: cfg.ContentWindowSize,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create MCP server: %w", err)
@@ -194,17 +218,22 @@ func RunStdioServer(cfg StdioServerConfig) error {
 
 	stdioServer := server.NewStdioServer(ghServer)
 
-	logrusLogger := logrus.New()
+	var slogHandler slog.Handler
+	var logOutput io.Writer
 	if cfg.LogFilePath != "" {
 		file, err := os.OpenFile(cfg.LogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
 			return fmt.Errorf("failed to open log file: %w", err)
 		}
-
-		logrusLogger.SetLevel(logrus.DebugLevel)
-		logrusLogger.SetOutput(file)
+		logOutput = file
+		slogHandler = slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelDebug})
+	} else {
+		logOutput = os.Stderr
+		slogHandler = slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: slog.LevelInfo})
 	}
-	stdLogger := log.New(logrusLogger.Writer(), "stdioserver", 0)
+	logger := slog.New(slogHandler)
+	logger.Info("starting server", "version", cfg.Version, "host", cfg.Host, "dynamicToolsets", cfg.DynamicToolsets, "readOnly", cfg.ReadOnly)
+	stdLogger := log.New(logOutput, stdioServerLogPrefix, 0)
 	stdioServer.SetErrorLogger(stdLogger)
 
 	if cfg.ExportTranslations {
@@ -218,10 +247,11 @@ func RunStdioServer(cfg StdioServerConfig) error {
 		in, out := io.Reader(os.Stdin), io.Writer(os.Stdout)
 
 		if cfg.EnableCommandLogging {
-			loggedIO := mcplog.NewIOLogger(in, out, logrusLogger)
+			loggedIO := mcplog.NewIOLogger(in, out, logger)
 			in, out = loggedIO, loggedIO
 		}
-
+		// enable GitHub errors in the context
+		ctx := errors.ContextWithGitHubErrors(ctx)
 		errC <- stdioServer.Listen(ctx, in, out)
 	}()
 
@@ -231,9 +261,10 @@ func RunStdioServer(cfg StdioServerConfig) error {
 	// Wait for shutdown signal
 	select {
 	case <-ctx.Done():
-		logrusLogger.Infof("shutting down server...")
+		logger.Info("shutting down server", "signal", "context done")
 	case err := <-errC:
 		if err != nil {
+			logger.Error("error running server", "error", err)
 			return fmt.Errorf("error running server: %w", err)
 		}
 	}
@@ -245,6 +276,42 @@ type apiHost struct {
 	baseRESTURL *url.URL
 	graphqlURL  *url.URL
 	uploadURL   *url.URL
+	rawURL      *url.URL
+}
+
+// newLocalhostHost creates a new apiHost for localhost, which is used for development purposes.
+func newLocalhostHost(hostname string) (apiHost, error) {
+	u, err := url.Parse(hostname)
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost URL: %w", err)
+	}
+
+	restURL, err := url.Parse(fmt.Sprintf("%s://api.%s/", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost REST URL: %w", err)
+	}
+
+	gqlURL, err := url.Parse(fmt.Sprintf("%s://api.%s/graphql", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost GraphQL URL: %w", err)
+	}
+
+	uploadURL, err := url.Parse(fmt.Sprintf("%s://uploads.%s", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost Upload URL: %w", err)
+	}
+
+	rawURL, err := url.Parse(fmt.Sprintf("%s://raw.%s/", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost Raw URL: %w", err)
+	}
+
+	return apiHost{
+		baseRESTURL: restURL,
+		graphqlURL:  gqlURL,
+		uploadURL:   uploadURL,
+		rawURL:      rawURL,
+	}, nil
 }
 
 func newDotcomHost() (apiHost, error) {
@@ -263,10 +330,16 @@ func newDotcomHost() (apiHost, error) {
 		return apiHost{}, fmt.Errorf("failed to parse dotcom Upload URL: %w", err)
 	}
 
+	rawURL, err := url.Parse("https://raw.githubusercontent.com/")
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse dotcom Raw URL: %w", err)
+	}
+
 	return apiHost{
 		baseRESTURL: baseRestURL,
 		graphqlURL:  gqlURL,
 		uploadURL:   uploadURL,
+		rawURL:      rawURL,
 	}, nil
 }
 
@@ -296,10 +369,16 @@ func newGHECHost(hostname string) (apiHost, error) {
 		return apiHost{}, fmt.Errorf("failed to parse GHEC Upload URL: %w", err)
 	}
 
+	rawURL, err := url.Parse(fmt.Sprintf("https://raw.%s/", u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse GHEC Raw URL: %w", err)
+	}
+
 	return apiHost{
 		baseRESTURL: restURL,
 		graphqlURL:  gqlURL,
 		uploadURL:   uploadURL,
+		rawURL:      rawURL,
 	}, nil
 }
 
@@ -323,11 +402,16 @@ func newGHESHost(hostname string) (apiHost, error) {
 	if err != nil {
 		return apiHost{}, fmt.Errorf("failed to parse GHES Upload URL: %w", err)
 	}
+	rawURL, err := url.Parse(fmt.Sprintf("%s://%s/raw/", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse GHES Raw URL: %w", err)
+	}
 
 	return apiHost{
 		baseRESTURL: restURL,
 		graphqlURL:  gqlURL,
 		uploadURL:   uploadURL,
+		rawURL:      rawURL,
 	}, nil
 }
 
@@ -344,6 +428,10 @@ func parseAPIHost(s string) (apiHost, error) {
 
 	if u.Scheme == "" {
 		return apiHost{}, fmt.Errorf("host must have a scheme (http or https): %s", s)
+	}
+
+	if strings.HasSuffix(u.Hostname(), "localhost") {
+		return newLocalhostHost(s)
 	}
 
 	if strings.HasSuffix(u.Hostname(), "github.com") {

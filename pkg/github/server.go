@@ -1,10 +1,11 @@
 package github
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 
-	"github.com/google/go-github/v69/github"
+	"github.com/google/go-github/v74/github"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -33,7 +34,7 @@ func NewServer(version string, opts ...server.ServerOption) *server.MCPServer {
 // It returns the value, a boolean indicating if the parameter was present, and an error if the type is wrong.
 func OptionalParamOK[T any](r mcp.CallToolRequest, p string) (value T, ok bool, err error) {
 	// Check if the parameter is present in the request
-	val, exists := r.Params.Arguments[p]
+	val, exists := r.GetArguments()[p]
 	if !exists {
 		// Not present, return zero value, false, no error
 		return
@@ -59,30 +60,30 @@ func isAcceptedError(err error) bool {
 	return errors.As(err, &acceptedError)
 }
 
-// requiredParam is a helper function that can be used to fetch a requested parameter from the request.
+// RequiredParam is a helper function that can be used to fetch a requested parameter from the request.
 // It does the following checks:
 // 1. Checks if the parameter is present in the request.
 // 2. Checks if the parameter is of the expected type.
 // 3. Checks if the parameter is not empty, i.e: non-zero value
-func requiredParam[T comparable](r mcp.CallToolRequest, p string) (T, error) {
+func RequiredParam[T comparable](r mcp.CallToolRequest, p string) (T, error) {
 	var zero T
 
 	// Check if the parameter is present in the request
-	if _, ok := r.Params.Arguments[p]; !ok {
+	if _, ok := r.GetArguments()[p]; !ok {
 		return zero, fmt.Errorf("missing required parameter: %s", p)
 	}
 
 	// Check if the parameter is of the expected type
-	if _, ok := r.Params.Arguments[p].(T); !ok {
+	val, ok := r.GetArguments()[p].(T)
+	if !ok {
 		return zero, fmt.Errorf("parameter %s is not of type %T", p, zero)
 	}
 
-	if r.Params.Arguments[p].(T) == zero {
+	if val == zero {
 		return zero, fmt.Errorf("missing required parameter: %s", p)
-
 	}
 
-	return r.Params.Arguments[p].(T), nil
+	return val, nil
 }
 
 // RequiredInt is a helper function that can be used to fetch a requested parameter from the request.
@@ -91,7 +92,7 @@ func requiredParam[T comparable](r mcp.CallToolRequest, p string) (T, error) {
 // 2. Checks if the parameter is of the expected type.
 // 3. Checks if the parameter is not empty, i.e: non-zero value
 func RequiredInt(r mcp.CallToolRequest, p string) (int, error) {
-	v, err := requiredParam[float64](r, p)
+	v, err := RequiredParam[float64](r, p)
 	if err != nil {
 		return 0, err
 	}
@@ -106,16 +107,16 @@ func OptionalParam[T any](r mcp.CallToolRequest, p string) (T, error) {
 	var zero T
 
 	// Check if the parameter is present in the request
-	if _, ok := r.Params.Arguments[p]; !ok {
+	if _, ok := r.GetArguments()[p]; !ok {
 		return zero, nil
 	}
 
 	// Check if the parameter is of the expected type
-	if _, ok := r.Params.Arguments[p].(T); !ok {
-		return zero, fmt.Errorf("parameter %s is not of type %T, is %T", p, zero, r.Params.Arguments[p])
+	if _, ok := r.GetArguments()[p].(T); !ok {
+		return zero, fmt.Errorf("parameter %s is not of type %T, is %T", p, zero, r.GetArguments()[p])
 	}
 
-	return r.Params.Arguments[p].(T), nil
+	return r.GetArguments()[p].(T), nil
 }
 
 // OptionalIntParam is a helper function that can be used to fetch a requested parameter from the request.
@@ -143,17 +144,32 @@ func OptionalIntParamWithDefault(r mcp.CallToolRequest, p string, d int) (int, e
 	return v, nil
 }
 
+// OptionalBoolParamWithDefault is a helper function that can be used to fetch a requested parameter from the request
+// similar to optionalBoolParam, but it also takes a default value.
+func OptionalBoolParamWithDefault(r mcp.CallToolRequest, p string, d bool) (bool, error) {
+	args := r.GetArguments()
+	_, ok := args[p]
+	v, err := OptionalParam[bool](r, p)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return d, nil
+	}
+	return v, nil
+}
+
 // OptionalStringArrayParam is a helper function that can be used to fetch a requested parameter from the request.
 // It does the following checks:
 // 1. Checks if the parameter is present in the request, if not, it returns its zero-value
 // 2. If it is present, iterates the elements and checks each is a string
 func OptionalStringArrayParam(r mcp.CallToolRequest, p string) ([]string, error) {
 	// Check if the parameter is present in the request
-	if _, ok := r.Params.Arguments[p]; !ok {
+	if _, ok := r.GetArguments()[p]; !ok {
 		return []string{}, nil
 	}
 
-	switch v := r.Params.Arguments[p].(type) {
+	switch v := r.GetArguments()[p].(type) {
 	case nil:
 		return []string{}, nil
 	case []string:
@@ -169,12 +185,12 @@ func OptionalStringArrayParam(r mcp.CallToolRequest, p string) ([]string, error)
 		}
 		return strSlice, nil
 	default:
-		return []string{}, fmt.Errorf("parameter %s could not be coerced to []string, is %T", p, r.Params.Arguments[p])
+		return []string{}, fmt.Errorf("parameter %s could not be coerced to []string, is %T", p, r.GetArguments()[p])
 	}
 }
 
-// WithPagination returns a ToolOption that adds "page" and "perPage" parameters to the tool.
-// The "page" parameter is optional, min 1. The "perPage" parameter is optional, min 1, max 100.
+// WithPagination adds REST API pagination parameters to a tool.
+// https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
 func WithPagination() mcp.ToolOption {
 	return func(tool *mcp.Tool) {
 		mcp.WithNumber("page",
@@ -190,12 +206,49 @@ func WithPagination() mcp.ToolOption {
 	}
 }
 
-type PaginationParams struct {
-	page    int
-	perPage int
+// WithUnifiedPagination adds REST API pagination parameters to a tool.
+// GraphQL tools will use this and convert page/perPage to GraphQL cursor parameters internally.
+func WithUnifiedPagination() mcp.ToolOption {
+	return func(tool *mcp.Tool) {
+		mcp.WithNumber("page",
+			mcp.Description("Page number for pagination (min 1)"),
+			mcp.Min(1),
+		)(tool)
+
+		mcp.WithNumber("perPage",
+			mcp.Description("Results per page for pagination (min 1, max 100)"),
+			mcp.Min(1),
+			mcp.Max(100),
+		)(tool)
+
+		mcp.WithString("after",
+			mcp.Description("Cursor for pagination. Use the endCursor from the previous page's PageInfo for GraphQL APIs."),
+		)(tool)
+	}
 }
 
-// OptionalPaginationParams returns the "page" and "perPage" parameters from the request,
+// WithCursorPagination adds only cursor-based pagination parameters to a tool (no page parameter).
+func WithCursorPagination() mcp.ToolOption {
+	return func(tool *mcp.Tool) {
+		mcp.WithNumber("perPage",
+			mcp.Description("Results per page for pagination (min 1, max 100)"),
+			mcp.Min(1),
+			mcp.Max(100),
+		)(tool)
+
+		mcp.WithString("after",
+			mcp.Description("Cursor for pagination. Use the endCursor from the previous page's PageInfo for GraphQL APIs."),
+		)(tool)
+	}
+}
+
+type PaginationParams struct {
+	Page    int
+	PerPage int
+	After   string
+}
+
+// OptionalPaginationParams returns the "page", "perPage", and "after" parameters from the request,
 // or their default values if not present, "page" default is 1, "perPage" default is 30.
 // In future, we may want to make the default values configurable, or even have this
 // function returned from `withPagination`, where the defaults are provided alongside
@@ -209,8 +262,82 @@ func OptionalPaginationParams(r mcp.CallToolRequest) (PaginationParams, error) {
 	if err != nil {
 		return PaginationParams{}, err
 	}
+	after, err := OptionalParam[string](r, "after")
+	if err != nil {
+		return PaginationParams{}, err
+	}
 	return PaginationParams{
-		page:    page,
-		perPage: perPage,
+		Page:    page,
+		PerPage: perPage,
+		After:   after,
 	}, nil
+}
+
+// OptionalCursorPaginationParams returns the "perPage" and "after" parameters from the request,
+// without the "page" parameter, suitable for cursor-based pagination only.
+func OptionalCursorPaginationParams(r mcp.CallToolRequest) (CursorPaginationParams, error) {
+	perPage, err := OptionalIntParamWithDefault(r, "perPage", 30)
+	if err != nil {
+		return CursorPaginationParams{}, err
+	}
+	after, err := OptionalParam[string](r, "after")
+	if err != nil {
+		return CursorPaginationParams{}, err
+	}
+	return CursorPaginationParams{
+		PerPage: perPage,
+		After:   after,
+	}, nil
+}
+
+type CursorPaginationParams struct {
+	PerPage int
+	After   string
+}
+
+// ToGraphQLParams converts cursor pagination parameters to GraphQL-specific parameters.
+func (p CursorPaginationParams) ToGraphQLParams() (*GraphQLPaginationParams, error) {
+	if p.PerPage > 100 {
+		return nil, fmt.Errorf("perPage value %d exceeds maximum of 100", p.PerPage)
+	}
+	if p.PerPage < 0 {
+		return nil, fmt.Errorf("perPage value %d cannot be negative", p.PerPage)
+	}
+	first := int32(p.PerPage)
+
+	var after *string
+	if p.After != "" {
+		after = &p.After
+	}
+
+	return &GraphQLPaginationParams{
+		First: &first,
+		After: after,
+	}, nil
+}
+
+type GraphQLPaginationParams struct {
+	First *int32
+	After *string
+}
+
+// ToGraphQLParams converts REST API pagination parameters to GraphQL-specific parameters.
+// This converts page/perPage to first parameter for GraphQL queries.
+// If After is provided, it takes precedence over page-based pagination.
+func (p PaginationParams) ToGraphQLParams() (*GraphQLPaginationParams, error) {
+	// Convert to CursorPaginationParams and delegate to avoid duplication
+	cursor := CursorPaginationParams{
+		PerPage: p.PerPage,
+		After:   p.After,
+	}
+	return cursor.ToGraphQLParams()
+}
+
+func MarshalledTextResult(v any) *mcp.CallToolResult {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("failed to marshal text result to json", err)
+	}
+
+	return mcp.NewToolResultText(string(data))
 }

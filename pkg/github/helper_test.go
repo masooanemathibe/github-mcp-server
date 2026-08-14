@@ -109,12 +109,12 @@ func mockResponse(t *testing.T, code int, body interface{}) http.HandlerFunc {
 }
 
 // createMCPRequest is a helper function to create a MCP request with the given arguments.
-func createMCPRequest(args map[string]any) mcp.CallToolRequest {
+func createMCPRequest(args any) mcp.CallToolRequest {
 	return mcp.CallToolRequest{
 		Params: struct {
-			Name      string         `json:"name"`
-			Arguments map[string]any `json:"arguments,omitempty"`
-			Meta      *mcp.Meta      `json:"_meta,omitempty"`
+			Name      string    `json:"name"`
+			Arguments any       `json:"arguments,omitempty"`
+			Meta      *mcp.Meta `json:"_meta,omitempty"`
 		}{
 			Arguments: args,
 		},
@@ -130,6 +130,36 @@ func getTextResult(t *testing.T, result *mcp.CallToolResult) mcp.TextContent {
 	textContent := result.Content[0].(mcp.TextContent)
 	assert.Equal(t, "text", textContent.Type)
 	return textContent
+}
+
+func getErrorResult(t *testing.T, result *mcp.CallToolResult) mcp.TextContent {
+	res := getTextResult(t, result)
+	require.True(t, result.IsError, "expected tool call result to be an error")
+	return res
+}
+
+// getTextResourceResult is a helper function that returns a text result from a tool call.
+func getTextResourceResult(t *testing.T, result *mcp.CallToolResult) mcp.TextResourceContents {
+	t.Helper()
+	assert.NotNil(t, result)
+	require.Len(t, result.Content, 2)
+	content := result.Content[1]
+	require.IsType(t, mcp.EmbeddedResource{}, content)
+	resource := content.(mcp.EmbeddedResource)
+	require.IsType(t, mcp.TextResourceContents{}, resource.Resource)
+	return resource.Resource.(mcp.TextResourceContents)
+}
+
+// getBlobResourceResult is a helper function that returns a blob result from a tool call.
+func getBlobResourceResult(t *testing.T, result *mcp.CallToolResult) mcp.BlobResourceContents {
+	t.Helper()
+	assert.NotNil(t, result)
+	require.Len(t, result.Content, 2)
+	content := result.Content[1]
+	require.IsType(t, mcp.EmbeddedResource{}, content)
+	resource := content.(mcp.EmbeddedResource)
+	require.IsType(t, mcp.BlobResourceContents{}, resource.Resource)
+	return resource.Resource.(mcp.BlobResourceContents)
 }
 
 func TestOptionalParamOK(t *testing.T) {

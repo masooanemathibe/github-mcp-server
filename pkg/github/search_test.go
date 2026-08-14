@@ -6,8 +6,9 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/github/github-mcp-server/internal/toolsnaps"
 	"github.com/github/github-mcp-server/pkg/translations"
-	"github.com/google/go-github/v69/github"
+	"github.com/google/go-github/v74/github"
 	"github.com/migueleliasweb/go-github-mock/src/mock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,10 +18,13 @@ func Test_SearchRepositories(t *testing.T) {
 	// Verify tool definition once
 	mockClient := github.NewClient(nil)
 	tool, _ := SearchRepositories(stubGetClientFn(mockClient), translations.NullTranslationHelper)
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
 
 	assert.Equal(t, "search_repositories", tool.Name)
 	assert.NotEmpty(t, tool.Description)
 	assert.Contains(t, tool.InputSchema.Properties, "query")
+	assert.Contains(t, tool.InputSchema.Properties, "sort")
+	assert.Contains(t, tool.InputSchema.Properties, "order")
 	assert.Contains(t, tool.InputSchema.Properties, "page")
 	assert.Contains(t, tool.InputSchema.Properties, "perPage")
 	assert.ElementsMatch(t, tool.InputSchema.Required, []string{"query"})
@@ -64,6 +68,8 @@ func Test_SearchRepositories(t *testing.T) {
 					mock.GetSearchRepositories,
 					expectQueryParams(t, map[string]string{
 						"q":        "golang test",
+						"sort":     "stars",
+						"order":    "desc",
 						"page":     "2",
 						"per_page": "10",
 					}).andThen(
@@ -73,6 +79,8 @@ func Test_SearchRepositories(t *testing.T) {
 			),
 			requestArgs: map[string]interface{}{
 				"query":   "golang test",
+				"sort":    "stars",
+				"order":   "desc",
 				"page":    float64(2),
 				"perPage": float64(10),
 			},
@@ -132,47 +140,108 @@ func Test_SearchRepositories(t *testing.T) {
 
 			// Verify results
 			if tc.expectError {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tc.expectedErrMsg)
+				require.NoError(t, err)
+				require.True(t, result.IsError)
+				errorContent := getErrorResult(t, result)
+				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
 				return
 			}
 
 			require.NoError(t, err)
+			require.False(t, result.IsError)
 
 			// Parse the result and get the text content if no error
 			textContent := getTextResult(t, result)
 
 			// Unmarshal and verify the result
-			var returnedResult github.RepositoriesSearchResult
+			var returnedResult MinimalSearchRepositoriesResult
 			err = json.Unmarshal([]byte(textContent.Text), &returnedResult)
 			require.NoError(t, err)
-			assert.Equal(t, *tc.expectedResult.Total, *returnedResult.Total)
-			assert.Equal(t, *tc.expectedResult.IncompleteResults, *returnedResult.IncompleteResults)
-			assert.Len(t, returnedResult.Repositories, len(tc.expectedResult.Repositories))
-			for i, repo := range returnedResult.Repositories {
-				assert.Equal(t, *tc.expectedResult.Repositories[i].ID, *repo.ID)
-				assert.Equal(t, *tc.expectedResult.Repositories[i].Name, *repo.Name)
-				assert.Equal(t, *tc.expectedResult.Repositories[i].FullName, *repo.FullName)
-				assert.Equal(t, *tc.expectedResult.Repositories[i].HTMLURL, *repo.HTMLURL)
+			assert.Equal(t, *tc.expectedResult.Total, returnedResult.TotalCount)
+			assert.Equal(t, *tc.expectedResult.IncompleteResults, returnedResult.IncompleteResults)
+			assert.Len(t, returnedResult.Items, len(tc.expectedResult.Repositories))
+			for i, repo := range returnedResult.Items {
+				assert.Equal(t, *tc.expectedResult.Repositories[i].ID, repo.ID)
+				assert.Equal(t, *tc.expectedResult.Repositories[i].Name, repo.Name)
+				assert.Equal(t, *tc.expectedResult.Repositories[i].FullName, repo.FullName)
+				assert.Equal(t, *tc.expectedResult.Repositories[i].HTMLURL, repo.HTMLURL)
 			}
 
 		})
 	}
 }
 
+func Test_SearchRepositories_FullOutput(t *testing.T) {
+	mockSearchResult := &github.RepositoriesSearchResult{
+		Total:             github.Ptr(1),
+		IncompleteResults: github.Ptr(false),
+		Repositories: []*github.Repository{
+			{
+				ID:              github.Ptr(int64(12345)),
+				Name:            github.Ptr("test-repo"),
+				FullName:        github.Ptr("owner/test-repo"),
+				HTMLURL:         github.Ptr("https://github.com/owner/test-repo"),
+				Description:     github.Ptr("Test repository"),
+				StargazersCount: github.Ptr(100),
+			},
+		},
+	}
+
+	mockedClient := mock.NewMockedHTTPClient(
+		mock.WithRequestMatchHandler(
+			mock.GetSearchRepositories,
+			expectQueryParams(t, map[string]string{
+				"q":        "golang test",
+				"page":     "1",
+				"per_page": "30",
+			}).andThen(
+				mockResponse(t, http.StatusOK, mockSearchResult),
+			),
+		),
+	)
+
+	client := github.NewClient(mockedClient)
+	_, handlerTest := SearchRepositories(stubGetClientFn(client), translations.NullTranslationHelper)
+
+	request := createMCPRequest(map[string]interface{}{
+		"query":          "golang test",
+		"minimal_output": false,
+	})
+
+	result, err := handlerTest(context.Background(), request)
+
+	require.NoError(t, err)
+	require.False(t, result.IsError)
+
+	textContent := getTextResult(t, result)
+
+	// Unmarshal as full GitHub API response
+	var returnedResult github.RepositoriesSearchResult
+	err = json.Unmarshal([]byte(textContent.Text), &returnedResult)
+	require.NoError(t, err)
+
+	// Verify it's the full API response, not minimal
+	assert.Equal(t, *mockSearchResult.Total, *returnedResult.Total)
+	assert.Equal(t, *mockSearchResult.IncompleteResults, *returnedResult.IncompleteResults)
+	assert.Len(t, returnedResult.Repositories, 1)
+	assert.Equal(t, *mockSearchResult.Repositories[0].ID, *returnedResult.Repositories[0].ID)
+	assert.Equal(t, *mockSearchResult.Repositories[0].Name, *returnedResult.Repositories[0].Name)
+}
+
 func Test_SearchCode(t *testing.T) {
 	// Verify tool definition once
 	mockClient := github.NewClient(nil)
 	tool, _ := SearchCode(stubGetClientFn(mockClient), translations.NullTranslationHelper)
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
 
 	assert.Equal(t, "search_code", tool.Name)
 	assert.NotEmpty(t, tool.Description)
-	assert.Contains(t, tool.InputSchema.Properties, "q")
+	assert.Contains(t, tool.InputSchema.Properties, "query")
 	assert.Contains(t, tool.InputSchema.Properties, "sort")
 	assert.Contains(t, tool.InputSchema.Properties, "order")
 	assert.Contains(t, tool.InputSchema.Properties, "perPage")
 	assert.Contains(t, tool.InputSchema.Properties, "page")
-	assert.ElementsMatch(t, tool.InputSchema.Required, []string{"q"})
+	assert.ElementsMatch(t, tool.InputSchema.Required, []string{"query"})
 
 	// Setup mock search results
 	mockSearchResult := &github.CodeSearchResult{
@@ -221,7 +290,7 @@ func Test_SearchCode(t *testing.T) {
 				),
 			),
 			requestArgs: map[string]interface{}{
-				"q":       "fmt.Println language:go",
+				"query":   "fmt.Println language:go",
 				"sort":    "indexed",
 				"order":   "desc",
 				"page":    float64(1),
@@ -245,7 +314,7 @@ func Test_SearchCode(t *testing.T) {
 				),
 			),
 			requestArgs: map[string]interface{}{
-				"q": "fmt.Println language:go",
+				"query": "fmt.Println language:go",
 			},
 			expectError:    false,
 			expectedResult: mockSearchResult,
@@ -262,7 +331,7 @@ func Test_SearchCode(t *testing.T) {
 				),
 			),
 			requestArgs: map[string]interface{}{
-				"q": "invalid:query",
+				"query": "invalid:query",
 			},
 			expectError:    true,
 			expectedErrMsg: "failed to search code",
@@ -283,12 +352,15 @@ func Test_SearchCode(t *testing.T) {
 
 			// Verify results
 			if tc.expectError {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tc.expectedErrMsg)
+				require.NoError(t, err)
+				require.True(t, result.IsError)
+				errorContent := getErrorResult(t, result)
+				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
 				return
 			}
 
 			require.NoError(t, err)
+			require.False(t, result.IsError)
 
 			// Parse the result and get the text content if no error
 			textContent := getTextResult(t, result)
@@ -315,15 +387,16 @@ func Test_SearchUsers(t *testing.T) {
 	// Verify tool definition once
 	mockClient := github.NewClient(nil)
 	tool, _ := SearchUsers(stubGetClientFn(mockClient), translations.NullTranslationHelper)
+	require.NoError(t, toolsnaps.Test(tool.Name, tool))
 
 	assert.Equal(t, "search_users", tool.Name)
 	assert.NotEmpty(t, tool.Description)
-	assert.Contains(t, tool.InputSchema.Properties, "q")
+	assert.Contains(t, tool.InputSchema.Properties, "query")
 	assert.Contains(t, tool.InputSchema.Properties, "sort")
 	assert.Contains(t, tool.InputSchema.Properties, "order")
 	assert.Contains(t, tool.InputSchema.Properties, "perPage")
 	assert.Contains(t, tool.InputSchema.Properties, "page")
-	assert.ElementsMatch(t, tool.InputSchema.Required, []string{"q"})
+	assert.ElementsMatch(t, tool.InputSchema.Required, []string{"query"})
 
 	// Setup mock search results
 	mockSearchResult := &github.UsersSearchResult{
@@ -335,9 +408,6 @@ func Test_SearchUsers(t *testing.T) {
 				ID:        github.Ptr(int64(1001)),
 				HTMLURL:   github.Ptr("https://github.com/user1"),
 				AvatarURL: github.Ptr("https://avatars.githubusercontent.com/u/1001"),
-				Type:      github.Ptr("User"),
-				Followers: github.Ptr(100),
-				Following: github.Ptr(50),
 			},
 			{
 				Login:     github.Ptr("user2"),
@@ -345,8 +415,6 @@ func Test_SearchUsers(t *testing.T) {
 				HTMLURL:   github.Ptr("https://github.com/user2"),
 				AvatarURL: github.Ptr("https://avatars.githubusercontent.com/u/1002"),
 				Type:      github.Ptr("User"),
-				Followers: github.Ptr(200),
-				Following: github.Ptr(75),
 			},
 		},
 	}
@@ -365,7 +433,7 @@ func Test_SearchUsers(t *testing.T) {
 				mock.WithRequestMatchHandler(
 					mock.GetSearchUsers,
 					expectQueryParams(t, map[string]string{
-						"q":        "location:finland language:go",
+						"q":        "type:user location:finland language:go",
 						"sort":     "followers",
 						"order":    "desc",
 						"page":     "1",
@@ -376,7 +444,7 @@ func Test_SearchUsers(t *testing.T) {
 				),
 			),
 			requestArgs: map[string]interface{}{
-				"q":       "location:finland language:go",
+				"query":   "location:finland language:go",
 				"sort":    "followers",
 				"order":   "desc",
 				"page":    float64(1),
@@ -391,7 +459,7 @@ func Test_SearchUsers(t *testing.T) {
 				mock.WithRequestMatchHandler(
 					mock.GetSearchUsers,
 					expectQueryParams(t, map[string]string{
-						"q":        "location:finland language:go",
+						"q":        "type:user location:finland language:go",
 						"page":     "1",
 						"per_page": "30",
 					}).andThen(
@@ -400,7 +468,47 @@ func Test_SearchUsers(t *testing.T) {
 				),
 			),
 			requestArgs: map[string]interface{}{
-				"q": "location:finland language:go",
+				"query": "location:finland language:go",
+			},
+			expectError:    false,
+			expectedResult: mockSearchResult,
+		},
+		{
+			name: "query with existing type:user filter - no duplication",
+			mockedClient: mock.NewMockedHTTPClient(
+				mock.WithRequestMatchHandler(
+					mock.GetSearchUsers,
+					expectQueryParams(t, map[string]string{
+						"q":        "type:user location:seattle followers:>100",
+						"page":     "1",
+						"per_page": "30",
+					}).andThen(
+						mockResponse(t, http.StatusOK, mockSearchResult),
+					),
+				),
+			),
+			requestArgs: map[string]interface{}{
+				"query": "type:user location:seattle followers:>100",
+			},
+			expectError:    false,
+			expectedResult: mockSearchResult,
+		},
+		{
+			name: "complex query with existing type:user filter and OR operators",
+			mockedClient: mock.NewMockedHTTPClient(
+				mock.WithRequestMatchHandler(
+					mock.GetSearchUsers,
+					expectQueryParams(t, map[string]string{
+						"q":        "type:user (location:seattle OR location:california) followers:>50",
+						"page":     "1",
+						"per_page": "30",
+					}).andThen(
+						mockResponse(t, http.StatusOK, mockSearchResult),
+					),
+				),
+			),
+			requestArgs: map[string]interface{}{
+				"query": "type:user (location:seattle OR location:california) followers:>50",
 			},
 			expectError:    false,
 			expectedResult: mockSearchResult,
@@ -417,7 +525,7 @@ func Test_SearchUsers(t *testing.T) {
 				),
 			),
 			requestArgs: map[string]interface{}{
-				"q": "invalid:query",
+				"query": "invalid:query",
 			},
 			expectError:    true,
 			expectedErrMsg: "failed to search users",
@@ -438,12 +546,15 @@ func Test_SearchUsers(t *testing.T) {
 
 			// Verify results
 			if tc.expectError {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tc.expectedErrMsg)
+				require.NoError(t, err)
+				require.True(t, result.IsError)
+				errorContent := getErrorResult(t, result)
+				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
 				return
 			}
 
 			require.NoError(t, err)
+			require.False(t, result.IsError)
 
 			// Parse the result and get the text content if no error
 			require.NotNil(t, result)
@@ -451,19 +562,181 @@ func Test_SearchUsers(t *testing.T) {
 			textContent := getTextResult(t, result)
 
 			// Unmarshal and verify the result
-			var returnedResult github.UsersSearchResult
+			var returnedResult MinimalSearchUsersResult
 			err = json.Unmarshal([]byte(textContent.Text), &returnedResult)
 			require.NoError(t, err)
-			assert.Equal(t, *tc.expectedResult.Total, *returnedResult.Total)
-			assert.Equal(t, *tc.expectedResult.IncompleteResults, *returnedResult.IncompleteResults)
-			assert.Len(t, returnedResult.Users, len(tc.expectedResult.Users))
-			for i, user := range returnedResult.Users {
-				assert.Equal(t, *tc.expectedResult.Users[i].Login, *user.Login)
-				assert.Equal(t, *tc.expectedResult.Users[i].ID, *user.ID)
-				assert.Equal(t, *tc.expectedResult.Users[i].HTMLURL, *user.HTMLURL)
-				assert.Equal(t, *tc.expectedResult.Users[i].AvatarURL, *user.AvatarURL)
-				assert.Equal(t, *tc.expectedResult.Users[i].Type, *user.Type)
-				assert.Equal(t, *tc.expectedResult.Users[i].Followers, *user.Followers)
+			assert.Equal(t, *tc.expectedResult.Total, returnedResult.TotalCount)
+			assert.Equal(t, *tc.expectedResult.IncompleteResults, returnedResult.IncompleteResults)
+			assert.Len(t, returnedResult.Items, len(tc.expectedResult.Users))
+			for i, user := range returnedResult.Items {
+				assert.Equal(t, *tc.expectedResult.Users[i].Login, user.Login)
+				assert.Equal(t, *tc.expectedResult.Users[i].ID, user.ID)
+				assert.Equal(t, *tc.expectedResult.Users[i].HTMLURL, user.ProfileURL)
+				assert.Equal(t, *tc.expectedResult.Users[i].AvatarURL, user.AvatarURL)
+			}
+		})
+	}
+}
+
+func Test_SearchOrgs(t *testing.T) {
+	// Verify tool definition once
+	mockClient := github.NewClient(nil)
+	tool, _ := SearchOrgs(stubGetClientFn(mockClient), translations.NullTranslationHelper)
+
+	assert.Equal(t, "search_orgs", tool.Name)
+	assert.NotEmpty(t, tool.Description)
+	assert.Contains(t, tool.InputSchema.Properties, "query")
+	assert.Contains(t, tool.InputSchema.Properties, "sort")
+	assert.Contains(t, tool.InputSchema.Properties, "order")
+	assert.Contains(t, tool.InputSchema.Properties, "perPage")
+	assert.Contains(t, tool.InputSchema.Properties, "page")
+	assert.ElementsMatch(t, tool.InputSchema.Required, []string{"query"})
+
+	// Setup mock search results
+	mockSearchResult := &github.UsersSearchResult{
+		Total:             github.Ptr(int(2)),
+		IncompleteResults: github.Ptr(false),
+		Users: []*github.User{
+			{
+				Login:     github.Ptr("org-1"),
+				ID:        github.Ptr(int64(111)),
+				HTMLURL:   github.Ptr("https://github.com/org-1"),
+				AvatarURL: github.Ptr("https://avatars.githubusercontent.com/u/111?v=4"),
+			},
+			{
+				Login:     github.Ptr("org-2"),
+				ID:        github.Ptr(int64(222)),
+				HTMLURL:   github.Ptr("https://github.com/org-2"),
+				AvatarURL: github.Ptr("https://avatars.githubusercontent.com/u/222?v=4"),
+			},
+		},
+	}
+
+	tests := []struct {
+		name           string
+		mockedClient   *http.Client
+		requestArgs    map[string]interface{}
+		expectError    bool
+		expectedResult *github.UsersSearchResult
+		expectedErrMsg string
+	}{
+		{
+			name: "successful org search",
+			mockedClient: mock.NewMockedHTTPClient(
+				mock.WithRequestMatchHandler(
+					mock.GetSearchUsers,
+					expectQueryParams(t, map[string]string{
+						"q":        "type:org github",
+						"page":     "1",
+						"per_page": "30",
+					}).andThen(
+						mockResponse(t, http.StatusOK, mockSearchResult),
+					),
+				),
+			),
+			requestArgs: map[string]interface{}{
+				"query": "github",
+			},
+			expectError:    false,
+			expectedResult: mockSearchResult,
+		},
+		{
+			name: "query with existing type:org filter - no duplication",
+			mockedClient: mock.NewMockedHTTPClient(
+				mock.WithRequestMatchHandler(
+					mock.GetSearchUsers,
+					expectQueryParams(t, map[string]string{
+						"q":        "type:org location:california followers:>1000",
+						"page":     "1",
+						"per_page": "30",
+					}).andThen(
+						mockResponse(t, http.StatusOK, mockSearchResult),
+					),
+				),
+			),
+			requestArgs: map[string]interface{}{
+				"query": "type:org location:california followers:>1000",
+			},
+			expectError:    false,
+			expectedResult: mockSearchResult,
+		},
+		{
+			name: "complex query with existing type:org filter and OR operators",
+			mockedClient: mock.NewMockedHTTPClient(
+				mock.WithRequestMatchHandler(
+					mock.GetSearchUsers,
+					expectQueryParams(t, map[string]string{
+						"q":        "type:org (location:seattle OR location:california OR location:newyork) repos:>10",
+						"page":     "1",
+						"per_page": "30",
+					}).andThen(
+						mockResponse(t, http.StatusOK, mockSearchResult),
+					),
+				),
+			),
+			requestArgs: map[string]interface{}{
+				"query": "type:org (location:seattle OR location:california OR location:newyork) repos:>10",
+			},
+			expectError:    false,
+			expectedResult: mockSearchResult,
+		},
+		{
+			name: "org search fails",
+			mockedClient: mock.NewMockedHTTPClient(
+				mock.WithRequestMatchHandler(
+					mock.GetSearchUsers,
+					http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = w.Write([]byte(`{"message": "Validation Failed"}`))
+					}),
+				),
+			),
+			requestArgs: map[string]interface{}{
+				"query": "invalid:query",
+			},
+			expectError:    true,
+			expectedErrMsg: "failed to search orgs",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Setup client with mock
+			client := github.NewClient(tc.mockedClient)
+			_, handler := SearchOrgs(stubGetClientFn(client), translations.NullTranslationHelper)
+
+			// Create call request
+			request := createMCPRequest(tc.requestArgs)
+
+			// Call handler
+			result, err := handler(context.Background(), request)
+
+			// Verify results
+			if tc.expectError {
+				require.NoError(t, err)
+				require.True(t, result.IsError)
+				errorContent := getErrorResult(t, result)
+				assert.Contains(t, errorContent.Text, tc.expectedErrMsg)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+
+			textContent := getTextResult(t, result)
+
+			// Unmarshal and verify the result
+			var returnedResult MinimalSearchUsersResult
+			err = json.Unmarshal([]byte(textContent.Text), &returnedResult)
+			require.NoError(t, err)
+			assert.Equal(t, *tc.expectedResult.Total, returnedResult.TotalCount)
+			assert.Equal(t, *tc.expectedResult.IncompleteResults, returnedResult.IncompleteResults)
+			assert.Len(t, returnedResult.Items, len(tc.expectedResult.Users))
+			for i, org := range returnedResult.Items {
+				assert.Equal(t, *tc.expectedResult.Users[i].Login, org.Login)
+				assert.Equal(t, *tc.expectedResult.Users[i].ID, org.ID)
+				assert.Equal(t, *tc.expectedResult.Users[i].HTMLURL, org.ProfileURL)
+				assert.Equal(t, *tc.expectedResult.Users[i].AvatarURL, org.AvatarURL)
 			}
 		})
 	}

@@ -1,17 +1,12 @@
 package toolsets
 
 import (
+	"errors"
 	"testing"
 )
 
-func TestNewToolsetGroup(t *testing.T) {
+func TestNewToolsetGroupIsEmptyWithoutEverythingOn(t *testing.T) {
 	tsg := NewToolsetGroup(false)
-	if tsg == nil {
-		t.Fatal("Expected NewToolsetGroup to return a non-nil pointer")
-	}
-	if tsg.Toolsets == nil {
-		t.Fatal("Expected Toolsets map to be initialized")
-	}
 	if len(tsg.Toolsets) != 0 {
 		t.Fatalf("Expected Toolsets map to be empty, got %d items", len(tsg.Toolsets))
 	}
@@ -139,7 +134,7 @@ func TestEnableToolsets(t *testing.T) {
 	tsg.AddToolset(toolset2)
 
 	// Test enabling multiple toolsets
-	err := tsg.EnableToolsets([]string{"toolset1", "toolset2"})
+	err := tsg.EnableToolsets([]string{"toolset1", "toolset2"}, &EnableToolsetsOptions{})
 	if err != nil {
 		t.Errorf("Expected no error when enabling toolsets, got: %v", err)
 	}
@@ -153,20 +148,35 @@ func TestEnableToolsets(t *testing.T) {
 	}
 
 	// Test with non-existent toolset in the list
-	err = tsg.EnableToolsets([]string{"toolset1", "non-existent"})
+	err = tsg.EnableToolsets([]string{"toolset1", "non-existent"}, nil)
+	if err != nil {
+		t.Errorf("Expected no error when ignoring unknown toolsets, got: %v", err)
+	}
+
+	err = tsg.EnableToolsets([]string{"toolset1", "non-existent"}, &EnableToolsetsOptions{
+		ErrorOnUnknown: false,
+	})
+	if err != nil {
+		t.Errorf("Expected no error when ignoring unknown toolsets, got: %v", err)
+	}
+
+	err = tsg.EnableToolsets([]string{"toolset1", "non-existent"}, &EnableToolsetsOptions{ErrorOnUnknown: true})
 	if err == nil {
 		t.Error("Expected error when enabling list with non-existent toolset")
 	}
+	if !errors.Is(err, NewToolsetDoesNotExistError("non-existent")) {
+		t.Errorf("Expected ToolsetDoesNotExistError when enabling non-existent toolset, got: %v", err)
+	}
 
 	// Test with empty list
-	err = tsg.EnableToolsets([]string{})
+	err = tsg.EnableToolsets([]string{}, &EnableToolsetsOptions{})
 	if err != nil {
 		t.Errorf("Expected no error with empty toolset list, got: %v", err)
 	}
 
 	// Test enabling everything through EnableToolsets
 	tsg = NewToolsetGroup(false)
-	err = tsg.EnableToolsets([]string{"all"})
+	err = tsg.EnableToolsets([]string{"all"}, &EnableToolsetsOptions{})
 	if err != nil {
 		t.Errorf("Expected no error when enabling 'all', got: %v", err)
 	}
@@ -189,14 +199,14 @@ func TestEnableEverything(t *testing.T) {
 	}
 
 	// Enable "all"
-	err := tsg.EnableToolsets([]string{"all"})
+	err := tsg.EnableToolsets([]string{"all"}, &EnableToolsetsOptions{})
 	if err != nil {
-		t.Errorf("Expected no error when enabling 'eall', got: %v", err)
+		t.Errorf("Expected no error when enabling 'all', got: %v", err)
 	}
 
 	// Verify everythingOn was set
 	if !tsg.everythingOn {
-		t.Error("Expected everythingOn to be true after enabling 'eall'")
+		t.Error("Expected everythingOn to be true after enabling 'all'")
 	}
 
 	// Verify the previously disabled toolset is now enabled
@@ -213,8 +223,8 @@ func TestEnableEverything(t *testing.T) {
 func TestIsEnabledWithEverythingOn(t *testing.T) {
 	tsg := NewToolsetGroup(false)
 
-	// Enable "everything"
-	err := tsg.EnableToolsets([]string{"all"})
+	// Enable "all"
+	err := tsg.EnableToolsets([]string{"all"}, &EnableToolsetsOptions{})
 	if err != nil {
 		t.Errorf("Expected no error when enabling 'all', got: %v", err)
 	}
@@ -226,5 +236,29 @@ func TestIsEnabledWithEverythingOn(t *testing.T) {
 
 	if !tsg.IsEnabled("another-toolset") {
 		t.Error("Expected IsEnabled to return true for any toolset when everythingOn is true")
+	}
+}
+
+func TestToolsetGroup_GetToolset(t *testing.T) {
+	tsg := NewToolsetGroup(false)
+	toolset := NewToolset("my-toolset", "desc")
+	tsg.AddToolset(toolset)
+
+	// Should find the toolset
+	got, err := tsg.GetToolset("my-toolset")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if got != toolset {
+		t.Errorf("expected to get the same toolset instance")
+	}
+
+	// Should not find a non-existent toolset
+	_, err = tsg.GetToolset("does-not-exist")
+	if err == nil {
+		t.Error("expected error for missing toolset, got nil")
+	}
+	if !errors.Is(err, NewToolsetDoesNotExistError("does-not-exist")) {
+		t.Errorf("expected error to be ToolsetDoesNotExistError, got %v", err)
 	}
 }

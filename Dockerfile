@@ -1,4 +1,4 @@
-FROM golang:1.24.3-alpine AS build
+FROM golang:1.25.1-alpine AS build
 ARG VERSION="dev"
 
 # Set the working directory
@@ -18,9 +18,15 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # Make a stage to run the app
 FROM gcr.io/distroless/base-debian12
+
+# Add required MCP server annotation
+LABEL io.modelcontextprotocol.server.name="io.github.github/github-mcp-server"
+
 # Set the working directory
 WORKDIR /server
 # Copy the binary from the build stage
 COPY --from=build /bin/github-mcp-server .
-# Command to run the server
-CMD ["./github-mcp-server", "stdio"]
+# Set the entrypoint to the server binary
+ENTRYPOINT ["/server/github-mcp-server"]
+# Default arguments for ENTRYPOINT
+CMD ["stdio"]
