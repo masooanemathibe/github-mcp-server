@@ -118,8 +118,8 @@ func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 
 	// Generate instructions based on enabled toolsets
 	instructions := github.GenerateInstructions(enabledToolsets)
-	
-	ghServer := github.NewServer(cfg.Version, 
+
+	ghServer := github.NewServer(cfg.Version,
 		server.WithInstructions(instructions),
 		server.WithHooks(hooks),
 	)
@@ -142,7 +142,7 @@ func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 
 	// Create default toolsets
 	tsg := github.DefaultToolsetGroup(cfg.ReadOnly, getClient, getGQLClient, getRawClient, cfg.Translator, cfg.ContentWindowSize)
-	err = tsg.EnableToolsets(enabledToolsets)
+	err = tsg.EnableToolsets(enabledToolsets, nil)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to enable toolsets: %w", err)
@@ -279,6 +279,41 @@ type apiHost struct {
 	rawURL      *url.URL
 }
 
+// newLocalhostHost creates a new apiHost for localhost, which is used for development purposes.
+func newLocalhostHost(hostname string) (apiHost, error) {
+	u, err := url.Parse(hostname)
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost URL: %w", err)
+	}
+
+	restURL, err := url.Parse(fmt.Sprintf("%s://api.%s/", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost REST URL: %w", err)
+	}
+
+	gqlURL, err := url.Parse(fmt.Sprintf("%s://api.%s/graphql", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost GraphQL URL: %w", err)
+	}
+
+	uploadURL, err := url.Parse(fmt.Sprintf("%s://uploads.%s", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost Upload URL: %w", err)
+	}
+
+	rawURL, err := url.Parse(fmt.Sprintf("%s://raw.%s/", u.Scheme, u.Hostname()))
+	if err != nil {
+		return apiHost{}, fmt.Errorf("failed to parse localhost Raw URL: %w", err)
+	}
+
+	return apiHost{
+		baseRESTURL: restURL,
+		graphqlURL:  gqlURL,
+		uploadURL:   uploadURL,
+		rawURL:      rawURL,
+	}, nil
+}
+
 func newDotcomHost() (apiHost, error) {
 	baseRestURL, err := url.Parse("https://api.github.com/")
 	if err != nil {
@@ -393,6 +428,10 @@ func parseAPIHost(s string) (apiHost, error) {
 
 	if u.Scheme == "" {
 		return apiHost{}, fmt.Errorf("host must have a scheme (http or https): %s", s)
+	}
+
+	if strings.HasSuffix(u.Hostname(), "localhost") {
+		return newLocalhostHost(s)
 	}
 
 	if strings.HasSuffix(u.Hostname(), "github.com") {
